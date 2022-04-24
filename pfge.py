@@ -89,7 +89,7 @@ print(*model_cfg.args)
 model = model_cfg.base(*model_cfg.args, num_classes=num_classes, **model_cfg.kwargs)
 model.to(args.device)
 optimizer = torch.optim.SGD(model.parameters(), lr=args.lr_max, momentum=args.momentum, weight_decay=args.wd)
-num_model = args.epochs / args.P
+num_model = args.epochs // args.P
 model_list = []
 model_list.append(model)
 swa_n = np.zeros(int(num_model))
@@ -134,9 +134,9 @@ for epoch in range(args.epochs):
             utils.bn_update(loaders["train"], model_list[i+1])
             pfge_res = utils.predict(loaders["test"], model_list[i+1])
             pfge_predictions = pfge_res["predictions"]
-            targets1 = pfge_res["targets"]
+            targets = pfge_res["targets"]
             pfge_predictions_sum += pfge_predictions
-            pfge_ens_acc = 100.0 * np.mean(np.argmax(pfge_predictions_sum, axis=1) == targets1)
+            pfge_ens_acc = 100.0 * np.mean(np.argmax(pfge_predictions_sum, axis=1) == targets)
             utils.save_checkpoint(args.dir, epoch + 1, name="pfge", state_dict=model_list[i+1].state_dict())
     else:
         train_res = utils.train_epochs(loaders['train'], model_list[i], criterion, optimizer_list[i], lr_schedule=lr_schedule, cuda=use_cuda)
@@ -150,9 +150,9 @@ for epoch in range(args.epochs):
             utils.bn_update(loaders["train"], model_list[i + 1])
             pfge_res = utils.predict(loaders["test"], model_list[i + 1])
             pfge_predictions = pfge_res["predictions"]
-            targets1 = pfge_res["targets"]
+            targets = pfge_res["targets"]
             pfge_predictions_sum += pfge_predictions
-            pfge_ens_acc = 100.0 * np.mean(np.argmax(pfge_predictions_sum, axis=1) == targets1)
+            pfge_ens_acc = 100.0 * np.mean(np.argmax(pfge_predictions_sum, axis=1) == targets)
             utils.save_checkpoint(args.dir, epoch + 1, name="pfge", state_dict=model_list[i + 1].state_dict())
 
     values = [epoch + 1, lr_schedule(1.0), train_res['loss'], train_res['accuracy'], test_res['loss'],
