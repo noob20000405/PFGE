@@ -37,4 +37,4 @@ Parameters: \
 ```lr1``` — maximum learning rates in the cycle \
 ```lr2``` — minimum learning rates in the cycle \
 ```cycle``` — cycle length in epochs \
-```P``` —  model recording period
+```P``` —  model recording period(default:10)
