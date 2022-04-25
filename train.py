@@ -102,7 +102,7 @@ def learning_rate_schedule(epoch):
 criterion = utils.cross_entropy
 optimizer = torch.optim.SGD(
     model.parameters(),
-    lr=args.lr,
+    lr=args.lr_init,
     momentum=args.momentum,
     weight_decay=args.wd
 )
