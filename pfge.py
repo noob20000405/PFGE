@@ -35,6 +35,12 @@ def _metrics_from_probs(probs: np.ndarray, labels: np.ndarray):
             ece += m.mean() * abs(correct[m].mean() - conf[m].mean())
     return {"acc": acc, "nll": nll, "ece": ece}
 
+def _build_model_for_eval():
+    m = model_cfg.base(*model_cfg.args, num_classes=num_classes, **model_cfg.kwargs)
+    m.to(args.device)
+    return m
+
+
 # ===========================
 # SnapshotBooster
 # ===========================
@@ -554,3 +560,25 @@ if args.booster:
             )
             print(f'\n=== Final Test ({args.algo.upper()} Eq-Avg, no tuning) ===')
             print(f"Acc: {eq_metrics_test['acc']:.4f} | NLL: {eq_metrics_test['nll']:.4f} | ECE(15): {eq_metrics_test['ece']:.4f}")
+
+# === Always report Eq-Avg on TEST at the end (independent of booster/mode) ===
+ckpt_paths = sorted(
+    glob.glob(os.path.join(args.dir, f"{'pfge' if args.algo=='pfge' else 'fge'}-*.pt")),
+    key=lambda p: int(os.path.basename(p).split('-')[1].split('.')[0])
+)
+
+if len(ckpt_paths) == 0:
+    print("[Final Test Eq-Avg] No snapshots found. Skipping.")
+elif 'test' not in loaders:
+    print("[Final Test Eq-Avg] No real TEST loader present. Skipping.")
+else:
+    metrics_test = eval_eq_ensemble_on_loader(
+        ckpt_paths=ckpt_paths,
+        loader=loaders['test'],
+        build_model_fn=_build_model_for_eval,
+        bn_loader=loaders['train'],
+        device=args.device
+    )
+    print(f"\n=== Final Test ({args.algo.upper()} Eq-Avg) ===")
+    print(f"Acc: {metrics_test['acc']:.4f} | NLL: {metrics_test['nll']:.4f} | ECE(15): {metrics_test['ece']:.4f}")
+
