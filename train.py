@@ -187,13 +187,13 @@ for epoch in range(start_epoch, args.epochs):
     train_res = utils.train_epoch(loaders['train'], model, criterion, optimizer, cuda=use_cuda)
     eval_res = utils.eval(eval_loader, model, criterion, cuda=use_cuda)
 
-    if epoch % args.save_freq == 0:
+    if ((epoch + 1) % args.save_freq == 0) or ((epoch + 1) == args.epochs):
         utils.save_checkpoint(
-            args.dir,
-            epoch,
+            args.dir, epoch + 1,
             state_dict=model.state_dict(),
             optimizer_state=optimizer.state_dict()
         )
+
 
     time_ep = time.time() - time_ep
     values = [epoch + 1, lr, train_res['loss'], train_res['accuracy'],
@@ -207,14 +207,7 @@ for epoch in range(start_epoch, args.epochs):
         table = table.split('\n')[2]
     print(table)
 
-# save final checkpoint if not just saved
-if args.epochs % args.save_freq != 0:
-    utils.save_checkpoint(
-        args.dir,
-        args.epochs,
-        state_dict=model.state_dict(),
-        optimizer_state=optimizer.state_dict()
-    )
+
 
 # ===== Final evaluation on the chosen eval split (val if available, else test) =====
 probs_list, labels_list = _collect_probs(
@@ -232,3 +225,4 @@ if args.eval_test_at_end and 'test' in loaders and _eval_name != 'test':
     test_metrics = _eval_probs_metrics(probs_list_t, labels_list_t)
     print('\n=== Final Test (no tuning) ===')
     print(f"Acc: {test_metrics['acc']:.4f} | NLL: {test_metrics['nll']:.4f} | ECE(15): {test_metrics['ece']:.4f}")
+
