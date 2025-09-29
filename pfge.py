@@ -363,10 +363,31 @@ for i in range(int(num_model)):
 
 criterion = utils.cross_entropy
 
-checkpoint = torch.load(args.ckpt)
+# --- robust checkpoint loading ---
+ckpt = torch.load(args.ckpt, map_location="cpu")
 start_epoch = 0
-model.load_state_dict(checkpoint['state_dict'])
-optimizer.load_state_dict(checkpoint['optimizer'])
+
+# 1) state_dict
+if isinstance(ckpt, dict) and "state_dict" in ckpt:
+    state_dict = ckpt["state_dict"]
+else:
+    state_dict = ckpt
+model.load_state_dict(state_dict, strict=True)
+
+# 2) optimizer state (optional)
+opt_state = None
+if isinstance(ckpt, dict):
+    opt_state = ckpt.get("optimizer_state", ckpt.get("optimizer", None))
+
+if opt_state is not None:
+    try:
+        optimizer.load_state_dict(opt_state)
+    except Exception as e:
+        print(f"[warn] failed to load optimizer state, start with fresh optimizer: {e}")
+else:
+    print("[info] no optimizer state in ckpt, start with fresh optimizer")
+# --- end robust checkpoint loading ---
+
 
 ensemble_size = 0
 N_test = len(loaders['test'].dataset)
@@ -508,3 +529,4 @@ if args.booster:
         )
         print('\n=== PFGE + Booster (function-side) ===')
         print(f"Acc: {metrics['acc']:.4f} | NLL: {metrics['nll']:.4f} | ECE(15): {metrics['ece']:.4f}")
+
