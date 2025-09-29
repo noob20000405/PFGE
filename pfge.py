@@ -263,17 +263,56 @@ class SnapshotBooster:
 
 
 # ===========================
+# 辅助：等权集成在任意 loader 上评估（用于最终 test）
+# ===========================
+@torch.no_grad()
+def eval_eq_ensemble_on_loader(
+    ckpt_paths: List[str],
+    loader,
+    build_model_fn: Callable[[], torch.nn.Module],
+    bn_loader,
+    device: torch.device,
+) -> Dict[str, float]:
+    if len(ckpt_paths) == 0:
+        return {"acc": 0.0, "nll": 0.0, "ece": 0.0}
+    # labels 一次性
+    labels_list = []
+    for _, y in loader:
+        labels_list.append(y.numpy())
+    labels = np.concatenate(labels_list, 0)
+    # 累加 probs
+    probs_sum = None
+    for pth in ckpt_paths:
+        sd = torch.load(pth, map_location="cpu")["state_dict"]
+        m = build_model_fn()
+        m.load_state_dict(sd, strict=True)
+        m.to(device)
+        utils.bn_update(bn_loader, m)
+        m.eval()
+
+        chunks = []
+        for x, _ in loader:
+            x = x.to(device, non_blocking=True)
+            chunks.append(F.softmax(m(x), dim=1).float().cpu().numpy())
+        probs = np.concatenate(chunks, 0)
+        probs_sum = probs if probs_sum is None else (probs_sum + probs)
+
+        del m
+        torch.cuda.empty_cache()
+
+    probs_eq = (probs_sum / float(len(ckpt_paths))).astype(np.float32)
+    return _metrics_from_probs(probs_eq, labels)
+
+
+# ===========================
 # PFGE main
 # ===========================
 parser = argparse.ArgumentParser(description='PFGE training')
 
 parser.add_argument('--dir', type=str, default=None, metavar='DIR',
                     help='training directory (default: /tmp/pfge)')
-
 parser.add_argument('--dataset', type=str, default='CIFAR10', metavar='DATASET',
                     help='dataset name (default: CIFAR10)')
-parser.add_argument('--use_test', action='store_true', default=True,
-                    help='if True: use real test set; if False: split a validation set from train')
 parser.add_argument('--data_path', type=str, default=None, metavar='PATH',
                     help='path to datasets location (default: None)')
 parser.add_argument('--batch_size', type=int, default=128, metavar='N',
@@ -283,35 +322,42 @@ parser.add_argument('--num-workers', type=int, default=4, metavar='N',
 parser.add_argument("--split_classes", type=int, default=None)
 parser.add_argument('--model', type=str, default='VGG16', metavar='MODEL',
                     help='model name (default: None)')
-
 parser.add_argument('--ckpt', type=str, default=None, metavar='CKPT',
                     help='checkpoint to eval (default: None)')
 
-parser.add_argument('--epochs', type=int, default=20, metavar='N',
-                    help='number of epochs to train (default: 20)')
-parser.add_argument('--cycle', type=int, default=4, metavar='N',
-                    help='cycle length in epochs (default: 4, must be even)')
-parser.add_argument('--P', type=int, default=10, help='model recording period (default: 10)')
-parser.add_argument('--lr_max', type=float, default=0.05, metavar='LR1',
-                    help='maximum learning rate in cycle (default: 0.05)')
-parser.add_argument('--lr_min', type=float, default=0.0005, metavar='LR2',
-                    help='minimum learning rate in cycle (default: 0.0005)')
-parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
-                    help='SGD momentum (default: 0.9)')
-parser.add_argument('--wd', type=float, default=5e-4, metavar='WD',
-                    help='weight decay (default: 5e-4)')
+# === 互斥：用 test 还是切 val ===
+mx = parser.add_mutually_exclusive_group()
+mx.add_argument('--use_test', dest='use_test', action='store_true',
+                help='evaluate/tune on real test set')
+mx.add_argument('--use_val',  dest='use_test', action='store_false',
+                help='split a validation set from train and evaluate on it')
+parser.set_defaults(use_test=True)
 
+# 只有 --use_val 时才生效的参数
 parser.add_argument('--val_size', type=int, default=5000,
-                    help='when use_test=False, number of images taken as validation from train')
+                    help='when using --use_val, number of images held out from train')
 parser.add_argument('--eval_test_at_end', action='store_true', default=False,
-                    help='also evaluate on real test once at the end (no tuning)')
+                    help='(optional) also evaluate ONCE on test at the very end')
 
-parser.add_argument('--seed', type=int, default=1, metavar='S', help='random seed (default: 1)')
+# PFGE 超参
+parser.add_argument('--epochs', type=int, default=20, metavar='N')
+parser.add_argument('--cycle', type=int, default=4, metavar='N',
+                    help='cycle length in epochs (must be even)')
+parser.add_argument('--P', type=int, default=10)
+parser.add_argument('--lr_max', type=float, default=0.05, metavar='LR1')
+parser.add_argument('--lr_min', type=float, default=0.0005, metavar='LR2')
+parser.add_argument('--momentum', type=float, default=0.9, metavar='M')
+parser.add_argument('--wd', type=float, default=5e-4, metavar='WD')
+parser.add_argument('--seed', type=int, default=1, metavar='S')
 
-# Booster switches
+# Booster 开关
 parser.add_argument('--booster', action='store_true', default=False,
                     help='enable function-side alpha learning on PFGE snapshots')
-parser.add_argument('--boost_mode', type=str, default='linear', choices=['linear','logpool'])
+# 兼容单一模式/双模式
+parser.add_argument('--boost_mode', type=str, default=None, choices=['linear','logpool'],
+                    help='run only this mode if specified')
+parser.add_argument('--boost_modes', type=str, default='both', choices=['both','linear','logpool'],
+                    help='if boost_mode not set, choose modes to run')
 parser.add_argument('--boost_steps', type=int, default=150)
 parser.add_argument('--boost_lr', type=float, default=0.3)
 parser.add_argument('--boost_l2', type=float, default=1e-3)
@@ -385,7 +431,6 @@ criterion = utils.cross_entropy
 
 # --- robust checkpoint loading ---
 ckpt = torch.load(args.ckpt, map_location="cpu")
-start_epoch = 0
 state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
 model.load_state_dict(state_dict, strict=True)
 opt_state = None
@@ -480,7 +525,7 @@ for epoch in range(args.epochs):
     print(table)
 
 # =======================
-# Booster Stage (optional)
+# Booster Stage (optional) —— 自动跑 linear + logpool
 # =======================
 if args.booster:
     # 收集 PFGE 快照
@@ -504,51 +549,77 @@ if args.booster:
         bn_loader = loaders['train']
         val_loader = eval_loader  # 在 val（若有）或 test（若没有 val）上学 α & 评测
 
-        booster = SnapshotBooster(
-            build_model_fn=_build_model,
-            bn_loader_train_aug=bn_loader,
-            device=args.device,
-            mode=args.boost_mode,
-            steps=args.boost_steps,
-            lr=args.boost_lr,
-            l2=args.boost_l2,
-            eta=args.boost_eta,
-            crit_fraction=args.boost_crit_fraction,
-            utils_module=utils,
-        )
+        # 最终要跑的模式列表
+        if args.boost_mode is not None:
+            modes_to_run = [args.boost_mode]
+        else:
+            modes_to_run = ['linear', 'logpool'] if args.boost_modes == 'both' else [args.boost_modes]
 
         # 参考模型用于选子集（用最后一个 SWA 输出）
         ref_sd = torch.load(ckpt_paths[-1], map_location='cpu')['state_dict']
         ref_model = _build_model()
         ref_model.load_state_dict(ref_sd, strict=True)
 
-        # 学 α（在 val/test 上，取决于 eval_loader）
-        alpha = booster.learn_alpha(
-            snapshots=ckpt_paths,
-            val_loader=val_loader,
-            ref_for_subset=ref_model,
-            ckpt_key='state_dict',
-        )
-        with open(os.path.join(args.dir, 'alpha.json'), 'w') as f:
-            json.dump({'alpha': alpha.tolist()}, f, indent=2)
+        results_val = {}
+        results_test = {}
 
-        # 评测（强化后，仍在 eval_loader）
-        metrics = booster.evaluate(
-            snapshots=ckpt_paths,
-            test_loader=val_loader,
-            alpha=alpha,
-            ckpt_key='state_dict',
-        )
-        print('\n=== PFGE + Booster (function-side) on {} ==='.format('val' if 'val' in loaders else 'test'))
-        print(f"Acc: {metrics['acc']:.4f} | NLL: {metrics['nll']:.4f} | ECE(15): {metrics['ece']:.4f}")
+        for mode in modes_to_run:
+            booster = SnapshotBooster(
+                build_model_fn=_build_model,
+                bn_loader_train_aug=bn_loader,
+                device=args.device,
+                mode=mode,
+                steps=args.boost_steps,
+                lr=args.boost_lr,
+                l2=args.boost_l2,
+                eta=args.boost_eta,
+                crit_fraction=args.boost_crit_fraction,
+                utils_module=utils,
+            )
 
-        # （可选）最后在真正的 test 上再评一次（不参与调参）
-        if args.eval_test_at_end and 'test' in loaders and val_loader is not loaders['test']:
-            metrics_test = booster.evaluate(
+            # 学 α（在 eval_loader 上）
+            alpha = booster.learn_alpha(
                 snapshots=ckpt_paths,
-                test_loader=loaders['test'],
+                val_loader=val_loader,
+                ref_for_subset=ref_model,
+                ckpt_key='state_dict',
+            )
+            # 保存 α
+            with open(os.path.join(args.dir, f'alpha.{mode}.json'), 'w') as f:
+                json.dump({'alpha': alpha.tolist()}, f, indent=2)
+
+            # 评测（强化后，仍在 eval_loader）
+            metrics = booster.evaluate(
+                snapshots=ckpt_paths,
+                test_loader=val_loader,
                 alpha=alpha,
                 ckpt_key='state_dict',
             )
-            print('\n=== Final Test (PFGE + Booster, no tuning) ===')
-            print(f"Acc: {metrics_test['acc']:.4f} | NLL: {metrics_test['nll']:.4f} | ECE(15): {metrics_test['ece']:.4f}")
+            results_val[mode] = metrics
+
+            print(f'\n=== PFGE + Booster [{mode}] on {("val" if "val" in loaders else "test")} ===')
+            print(f"Acc: {metrics['acc']:.4f} | NLL: {metrics['nll']:.4f} | ECE(15): {metrics['ece']:.4f}")
+
+            # （可选）最后在真正的 test 上再评一次（不参与调参）
+            if args.eval_test_at_end and 'test' in loaders and val_loader is not loaders['test']:
+                metrics_test = booster.evaluate(
+                    snapshots=ckpt_paths,
+                    test_loader=loaders['test'],
+                    alpha=alpha,
+                    ckpt_key='state_dict',
+                )
+                results_test[mode] = metrics_test
+                print(f'\n=== Final Test (PFGE + Booster [{mode}], no tuning) ===')
+                print(f"Acc: {metrics_test['acc']:.4f} | NLL: {metrics_test['nll']:.4f} | ECE(15): {metrics_test['ece']:.4f}")
+
+        # 额外：在 test 上报告一次 Eq-Avg（便于对比）
+        if args.eval_test_at_end and 'test' in loaders and val_loader is not loaders['test']:
+            eq_metrics_test = eval_eq_ensemble_on_loader(
+                ckpt_paths=ckpt_paths,
+                loader=loaders['test'],
+                build_model_fn=_build_model,
+                bn_loader=bn_loader,
+                device=args.device,
+            )
+            print('\n=== Final Test (PFGE Eq-Avg, no tuning) ===')
+            print(f"Acc: {eq_metrics_test['acc']:.4f} | NLL: {eq_metrics_test['nll']:.4f} | ECE(15): {eq_metrics_test['ece']:.4f}")
