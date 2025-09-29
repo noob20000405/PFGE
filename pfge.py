@@ -9,6 +9,9 @@ import torch.nn.functional as F
 import glob, json
 from typing import List, Union, Callable, Iterable, Dict, Any, Optional
 
+# 保证本目录优先（避免多副本导错）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import data
 import models
 import utils
@@ -16,14 +19,11 @@ import utils
 # ===========================
 # Utils: metrics (Acc/NLL/ECE)
 # ===========================
-def _metrics_from_probs(probs: np.ndarray, labels: np.ndarray) -> Dict[str, float]:
-    """Compute Acc / NLL / ECE(15 bins) from class probabilities."""
+def _metrics_from_probs(probs: np.ndarray, labels: np.ndarray):
     preds = probs.argmax(1)
     acc = float((preds == labels).mean())
-    # NLL
     p_true = np.clip(probs[np.arange(labels.size), labels], 1e-12, 1.0)
     nll = float(-np.log(p_true).mean())
-    # 15-bin ECE
     bins = np.linspace(0, 1, 16)
     conf = probs.max(1)
     correct = (preds == labels).astype(np.float32)
@@ -35,7 +35,6 @@ def _metrics_from_probs(probs: np.ndarray, labels: np.ndarray) -> Dict[str, floa
             ece += m.mean() * abs(correct[m].mean() - conf[m].mean())
     return {"acc": acc, "nll": nll, "ece": ece}
 
-
 # ===========================
 # SnapshotBooster
 # ===========================
@@ -43,15 +42,15 @@ class SnapshotBooster:
     def __init__(
         self,
         build_model_fn: Callable[[], torch.nn.Module],
-        bn_loader_train_aug,   # DataLoader（train/aug）用于 BN 重估
+        bn_loader_train_aug,   # train/aug DataLoader for BN re-estimation
         device: torch.device,
         mode: str = "linear",  # "linear" or "logpool"
         steps: int = 150,
         lr: float = 0.3,
-        l2: float = 1e-3,      # toward uniform
-        eta: float = 1e-2,     # correlation penalty
-        crit_fraction: float = 0.5,  # 选取验证集底部 margin 的比例；=0 或 >=1 表示不用子集
-        utils_module=None,     # 传入 utils（必须含 bn_update）
+        l2: float = 1e-3,
+        eta: float = 1e-2,
+        crit_fraction: float = 0.5,
+        utils_module=None,
     ):
         assert mode in ("linear", "logpool")
         self.build_model = build_model_fn
@@ -70,7 +69,7 @@ class SnapshotBooster:
         snapshots: Union[List[Dict[str, torch.Tensor]], List[str]],
         ckpt_key: Optional[str] = None,
         map_fn: Optional[Callable[[Any], Dict[str, torch.Tensor]]] = None,
-    ) -> Iterable[Dict[str, torch.Tensor]]:
+    ):
         if len(snapshots) == 0:
             return
         first = snapshots[0]
@@ -120,20 +119,17 @@ class SnapshotBooster:
         ckpt_key: Optional[str] = None,
         map_fn: Optional[Callable[[Any], Dict[str, torch.Tensor]]] = None,
     ) -> np.ndarray:
-        # 收集标签
         y_list = []
         for _, y in val_loader:
             y_list.append(y.numpy())
         y = np.concatenate(y_list, 0).astype(np.int64)
         N = y.shape[0]
 
-        # 选难样本子集（可选）
         if ref_for_subset is not None and (0.0 < self.crit_fraction < 1.0):
             S_idx = self._select_critical_indices(ref_for_subset, val_loader, self.crit_fraction)
         else:
             S_idx = None
 
-        # 缓存每个快照在 val 上的 probs/log-probs
         P_list, L_list = [], []
         for sd in self._iter_snapshots(snapshots, ckpt_key=ckpt_key, map_fn=map_fn):
             m = self.build_model()
@@ -141,7 +137,6 @@ class SnapshotBooster:
             m.to(self.device)
             self.utils.bn_update(self.bn_loader, m)
             m.eval()
-
             probs_chunks, logp_chunks = [], []
             with torch.no_grad():
                 for x, _ in val_loader:
@@ -160,21 +155,19 @@ class SnapshotBooster:
 
         K = len(P_list)
         assert K > 0
-        P = np.stack(P_list, 0).astype(np.float64)        # [K,N,C]
+        P = np.stack(P_list, 0).astype(np.float64)
         if self.mode == "logpool":
-            L = np.stack(L_list, 0).astype(np.float64)    # [K,N,C]
+            L = np.stack(L_list, 0).astype(np.float64)
 
-        # 相关性矩阵 M（true-class prob 行中心化协方差）
-        F_tc = np.stack([Pi[np.arange(N), y] for Pi in P_list], 0).astype(np.float64)  # [K,N]
+        F_tc = np.stack([Pi[np.arange(N), y] for Pi in P_list], 0).astype(np.float64)
         F_tc -= F_tc.mean(axis=1, keepdims=True)
-        M = (F_tc @ F_tc.T) / float(max(1, N))            # [K,K]
+        M = (F_tc @ F_tc.T) / float(max(1, N))
         tr = np.trace(M)
         if np.isfinite(tr) and tr > 1e-12:
             M *= (K / tr)
 
         phi = torch.zeros(K, dtype=torch.float64, requires_grad=True)
         opt = torch.optim.Adam([phi], lr=self.lr)
-
         y_t = torch.from_numpy(y).long()
         u_t = torch.ones(K, dtype=torch.float64) / float(K)
         M_t = torch.from_numpy(M).to(torch.float64)
@@ -185,7 +178,7 @@ class SnapshotBooster:
 
         for _ in range(1, self.steps + 1):
             opt.zero_grad()
-            w = torch.softmax(phi, dim=0)  # [K]
+            w = torch.softmax(phi, dim=0)
             if self.mode == "logpool":
                 log_mix = torch.einsum('k,knc->nc', w, L_t)
                 if S_t is not None:
@@ -221,24 +214,19 @@ class SnapshotBooster:
         alpha: np.ndarray,
         ckpt_key: Optional[str] = None,
         map_fn: Optional[Callable[[Any], Dict[str, torch.Tensor]]] = None,
-    ) -> Dict[str, float]:
+    ):
         alpha = np.asarray(alpha, dtype=np.float64)
         mix_accum = None
-
-        # labels 只收一次
         labels_list = []
         for _, y in test_loader:
             labels_list.append(y.numpy())
         labels = np.concatenate(labels_list, 0)
-
-        # 累加各快照的贡献
         for sd, w in zip(self._iter_snapshots(snapshots, ckpt_key=ckpt_key, map_fn=map_fn), alpha):
             m = self.build_model()
             m.load_state_dict(sd, strict=True)
             m.to(self.device)
             self.utils.bn_update(self.bn_loader, m)
             m.eval()
-
             chunks = []
             for x, _ in test_loader:
                 x = x.to(self.device, non_blocking=True)
@@ -246,41 +234,28 @@ class SnapshotBooster:
                     chunks.append(F.log_softmax(m(x), dim=1).float().cpu().numpy())
                 else:
                     chunks.append(F.softmax(m(x), dim=1).float().cpu().numpy())
-            pred = np.concatenate(chunks, 0)  # [N,C]
+            pred = np.concatenate(chunks, 0)
             contrib = w * pred
             mix_accum = contrib if mix_accum is None else (mix_accum + contrib)
-
             del m
             torch.cuda.empty_cache()
-
-        # 汇总成 probs 并计算指标
         if self.mode == "logpool":
             probs = torch.softmax(torch.from_numpy(mix_accum), dim=1).numpy().astype(np.float32)
         else:
             probs = mix_accum.astype(np.float32)
-
         return _metrics_from_probs(probs, labels)
-
 
 # ===========================
 # 辅助：等权集成在任意 loader 上评估（用于最终 test）
 # ===========================
 @torch.no_grad()
-def eval_eq_ensemble_on_loader(
-    ckpt_paths: List[str],
-    loader,
-    build_model_fn: Callable[[], torch.nn.Module],
-    bn_loader,
-    device: torch.device,
-) -> Dict[str, float]:
+def eval_eq_ensemble_on_loader(ckpt_paths, loader, build_model_fn, bn_loader, device):
     if len(ckpt_paths) == 0:
         return {"acc": 0.0, "nll": 0.0, "ece": 0.0}
-    # labels 一次性
     labels_list = []
     for _, y in loader:
         labels_list.append(y.numpy())
     labels = np.concatenate(labels_list, 0)
-    # 累加 probs
     probs_sum = None
     for pth in ckpt_paths:
         sd = torch.load(pth, map_location="cpu")["state_dict"]
@@ -289,102 +264,81 @@ def eval_eq_ensemble_on_loader(
         m.to(device)
         utils.bn_update(bn_loader, m)
         m.eval()
-
         chunks = []
         for x, _ in loader:
             x = x.to(device, non_blocking=True)
             chunks.append(F.softmax(m(x), dim=1).float().cpu().numpy())
         probs = np.concatenate(chunks, 0)
         probs_sum = probs if probs_sum is None else (probs_sum + probs)
-
         del m
         torch.cuda.empty_cache()
-
     probs_eq = (probs_sum / float(len(ckpt_paths))).astype(np.float32)
     return _metrics_from_probs(probs_eq, labels)
 
-
 # ===========================
-# PFGE main
+# PFGE / FGE main
 # ===========================
-parser = argparse.ArgumentParser(description='PFGE training')
-
-parser.add_argument('--dir', type=str, default=None, metavar='DIR',
-                    help='training directory (default: /tmp/pfge)')
-parser.add_argument('--dataset', type=str, default='CIFAR10', metavar='DATASET',
-                    help='dataset name (default: CIFAR10)')
-parser.add_argument('--data_path', type=str, default=None, metavar='PATH',
-                    help='path to datasets location (default: None)')
-parser.add_argument('--batch_size', type=int, default=128, metavar='N',
-                    help='input batch size (default: 128)')
-parser.add_argument('--num-workers', type=int, default=4, metavar='N',
-                    help='number of workers (default: 4)')
+parser = argparse.ArgumentParser(description='PFGE/FGE training')
+parser.add_argument('--dir', type=str, default=None, metavar='DIR')
+parser.add_argument('--dataset', type=str, default='CIFAR10', metavar='DATASET')
+parser.add_argument('--data_path', type=str, default=None, metavar='PATH')
+parser.add_argument('--batch_size', type=int, default=128, metavar='N')
+parser.add_argument('--num-workers', type=int, default=4, metavar='N')
 parser.add_argument("--split_classes", type=int, default=None)
-parser.add_argument('--model', type=str, default='VGG16', metavar='MODEL',
-                    help='model name (default: None)')
-parser.add_argument('--ckpt', type=str, default=None, metavar='CKPT',
-                    help='checkpoint to eval (default: None)')
+parser.add_argument('--model', type=str, default='VGG16', metavar='MODEL')
+parser.add_argument('--ckpt', type=str, default=None, metavar='CKPT')
 
-# === 互斥：用 test 还是切 val ===
+# eval split
 mx = parser.add_mutually_exclusive_group()
 mx.add_argument('--use_test', dest='use_test', action='store_true',
                 help='evaluate/tune on real test set')
 mx.add_argument('--use_val',  dest='use_test', action='store_false',
                 help='split a validation set from train and evaluate on it')
 parser.set_defaults(use_test=True)
+parser.add_argument('--val_size', type=int, default=5000)
+parser.add_argument('--eval_test_at_end', action='store_true', default=False)
 
-# 只有 --use_val 时才生效的参数
-parser.add_argument('--val_size', type=int, default=5000,
-                    help='when using --use_val, number of images held out from train')
-parser.add_argument('--eval_test_at_end', action='store_true', default=False,
-                    help='(optional) also evaluate ONCE on test at the very end')
+# algo
+parser.add_argument('--algo', type=str, default='pfge', choices=['pfge', 'fge'],
+                    help='pfge: moving-average snapshots; fge: single-model snapshots at cycle ends')
 
-# PFGE 超参
+# schedule
 parser.add_argument('--epochs', type=int, default=20, metavar='N')
-parser.add_argument('--cycle', type=int, default=4, metavar='N',
-                    help='cycle length in epochs (must be even)')
-parser.add_argument('--P', type=int, default=10)
+parser.add_argument('--cycle', type=int, default=4, metavar='N', help='must be even')
+parser.add_argument('--P', type=int, default=10, help='PFGE: recording period; FGE: ignored')
 parser.add_argument('--lr_max', type=float, default=0.05, metavar='LR1')
 parser.add_argument('--lr_min', type=float, default=0.0005, metavar='LR2')
 parser.add_argument('--momentum', type=float, default=0.9, metavar='M')
 parser.add_argument('--wd', type=float, default=5e-4, metavar='WD')
 parser.add_argument('--seed', type=int, default=1, metavar='S')
 
-# Booster 开关
-parser.add_argument('--booster', action='store_true', default=False,
-                    help='enable function-side alpha learning on PFGE snapshots')
-# 兼容单一模式/双模式
-parser.add_argument('--boost_mode', type=str, default=None, choices=['linear','logpool'],
-                    help='run only this mode if specified')
-parser.add_argument('--boost_modes', type=str, default='both', choices=['both','linear','logpool'],
-                    help='if boost_mode not set, choose modes to run')
+# Booster
+parser.add_argument('--booster', action='store_true', default=False)
+parser.add_argument('--boost_mode', type=str, default=None, choices=['linear','logpool'])
+parser.add_argument('--boost_modes', type=str, default='both', choices=['both','linear','logpool'])
 parser.add_argument('--boost_steps', type=int, default=150)
 parser.add_argument('--boost_lr', type=float, default=0.3)
 parser.add_argument('--boost_l2', type=float, default=1e-3)
 parser.add_argument('--boost_eta', type=float, default=1e-2)
-parser.add_argument('--boost_crit_fraction', type=float, default=0.5,
-                    help='use bottom-quantile (by margin) as hard subset; set 0/≥1 to disable')
-parser.add_argument('--boost_max_K', type=int, default=0,
-                    help='only use last K snapshots for booster (0=use all)')
+parser.add_argument('--boost_crit_fraction', type=float, default=0.5)
+parser.add_argument('--boost_max_K', type=int, default=0)
 
 args = parser.parse_args()
 
 use_cuda = torch.cuda.is_available()
 args.device = torch.device("cuda") if use_cuda else torch.device("cpu")
-
 assert args.cycle % 2 == 0, 'Cycle length should be even'
 
 os.makedirs(args.dir, exist_ok=True)
 with open(os.path.join(args.dir, 'pfge.sh'), 'w') as f:
-    f.write(' '.join(sys.argv))
-    f.write('\n')
+    f.write(' '.join(sys.argv)); f.write('\n')
 
 torch.backends.cudnn.benchmark = True
 torch.manual_seed(args.seed)
 if use_cuda:
     torch.cuda.manual_seed(args.seed)
 
-print("Using model %s" % args.model)
+print(f"Algo = {args.algo} | Using model {args.model}")
 model_cfg = getattr(models, args.model)
 
 print("Loading dataset %s from %s" % (args.dataset, args.data_path))
@@ -395,12 +349,10 @@ loaders, num_classes = data.loaders(
         args.num_workers,
         model_cfg.transform_train,
         model_cfg.transform_test,
-        use_validation=not args.use_test,   # False -> use_validation=True
+        use_validation=not args.use_test,
         val_size=args.val_size,
         split_classes=args.split_classes,
     )
-
-# 评估 loader：优先用 val
 eval_loader = loaders['val'] if ('val' in loaders) else loaders['test']
 _eval_name = 'val' if ('val' in loaders) else 'te'
 
@@ -410,26 +362,9 @@ model = model_cfg.base(*model_cfg.args, num_classes=num_classes, **model_cfg.kwa
 model.to(args.device)
 optimizer = torch.optim.SGD(model.parameters(), lr=args.lr_max, momentum=args.momentum, weight_decay=args.wd)
 
-# 成员个数与容器
-num_model = int(args.epochs // args.P)
-if num_model < 1:
-    raise ValueError(f"PFGE requires epochs >= P to produce at least 1 snapshot "
-                     f"(got epochs={args.epochs}, P={args.P}).")
-
-model_list = [model]
-optimizer_list = [optimizer]
-for _ in range(num_model):
-    model1 = model_cfg.base(*model_cfg.args, num_classes=num_classes, **model_cfg.kwargs)
-    model1.to(args.device)
-    optimizers = torch.optim.SGD(model1.parameters(), lr=args.lr_max, momentum=args.momentum, weight_decay=args.wd)
-    model_list.append(model1)
-    optimizer_list.append(optimizers)
-swa_n = np.zeros(num_model, dtype=np.int64)
-print(f"[PFGE init] epochs={args.epochs}, P={args.P}, num_model={num_model}, len(model_list)={len(model_list)}")
-
 criterion = utils.cross_entropy
 
-# --- robust checkpoint loading ---
+# load init checkpoint
 ckpt = torch.load(args.ckpt, map_location="cpu")
 state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
 model.load_state_dict(state_dict, strict=True)
@@ -443,83 +378,106 @@ if opt_state is not None:
         print(f"[warn] failed to load optimizer state, start with fresh optimizer: {e}")
 else:
     print("[info] no optimizer state in ckpt, start with fresh optimizer")
-# --- end robust checkpoint loading ---
 
-ensemble_size = 0
+# ensemble buffers
 N_eval = len(eval_loader.dataset)
-pfge_predictions_sum = np.zeros((N_eval, num_classes), dtype=np.float64)
-pfge_targets = None  # 固定一次 targets 以避免歧义
+ens_sum = np.zeros((N_eval, num_classes), dtype=np.float64)
+ens_targets = None
+ens_size = 0
 
+# table columns
 columns = ['ep', 'lr', 'tr_loss', 'tr_acc', f'{_eval_name}_loss', f'{_eval_name}_acc',
-           'pfge_ens_acc', 'pfge_ens_nll', 'pfge_ens_ece', 'time']
+           'ens_acc', 'ens_nll', 'ens_ece', 'time']
 
+# ==== PFGE-specific prep ====
+num_model = int(args.epochs // args.P) if args.algo == 'pfge' else 0
+if args.algo == 'pfge':
+    if num_model < 1:
+        raise ValueError(f"PFGE requires epochs >= P (got epochs={args.epochs}, P={args.P})")
+    model_list = [model]
+    optimizer_list = [optimizer]
+    for _ in range(num_model):
+        m1 = model_cfg.base(*model_cfg.args, num_classes=num_classes, **model_cfg.kwargs).to(args.device)
+        opt1 = torch.optim.SGD(m1.parameters(), lr=args.lr_max, momentum=args.momentum, weight_decay=args.wd)
+        model_list.append(m1); optimizer_list.append(opt1)
+    swa_n = np.zeros(num_model, dtype=np.int64)
+    print(f"[PFGE init] epochs={args.epochs}, P={args.P}, num_model={num_model}, len(model_list)={len(model_list)}")
+
+snap_prefix = 'pfge' if args.algo == 'pfge' else 'fge'
+
+# ================== training loop ==================
 for epoch in range(args.epochs):
-    time_ep = time.time()
+    t0 = time.time()
     lr_schedule = utils.cyclic_learning_rate(epoch, args.cycle, args.lr_max, args.lr_min)
-    i = epoch // args.P
 
-    if i == 0:
+    # ---- PFGE branch ----
+    if args.algo == 'pfge':
+        i = epoch // args.P
+        if i == 0:
+            train_res = utils.train_epochs(loaders['train'], model, criterion, optimizer,
+                                           lr_schedule=lr_schedule, cuda=use_cuda)
+            eval_res = utils.eval(eval_loader, model, criterion, cuda=use_cuda)
+            # mid-cycle SWA into next bucket
+            if (epoch % args.cycle + 1) == args.cycle // 2:
+                utils.moving_average(model_list[i+1], model, 1.0 / (swa_n[i] + 1))
+                swa_n[i] += 1
+            # record snapshot every P epochs
+            if (epoch + 1) % args.P == 0:
+                utils.bn_update(loaders['train'], model_list[i+1])
+                res = utils.predict(eval_loader, model_list[i+1])
+                probs = res["predictions"].astype(np.float64)
+                if ens_targets is None: ens_targets = res["targets"]
+                ens_sum += probs; ens_size += 1
+                eq = (ens_sum / float(ens_size)).astype(np.float32)
+                mets = _metrics_from_probs(eq, ens_targets)
+                print(f"[PFGE {ens_size}] Eq-avg Acc={mets['acc']:.4f}  NLL={mets['nll']:.4f}  ECE(15)={mets['ece']:.4f}")
+                utils.save_checkpoint(args.dir, epoch + 1, name=snap_prefix, state_dict=model_list[i+1].state_dict())
+        else:
+            train_res = utils.train_epochs(loaders['train'], model_list[i], criterion, optimizer_list[i],
+                                           lr_schedule=lr_schedule, cuda=use_cuda)
+            eval_res = utils.eval(eval_loader, model_list[i], criterion, cuda=use_cuda)
+            if (epoch % args.cycle + 1) == args.cycle // 2:
+                utils.moving_average(model_list[i+1], model_list[i], 1.0/(swa_n[i] + 1))
+                swa_n[i] += 1
+            if (epoch + 1) % args.P == 0:
+                utils.bn_update(loaders['train'], model_list[i+1])
+                res = utils.predict(eval_loader, model_list[i+1])
+                probs = res["predictions"].astype(np.float64)
+                if ens_targets is None: ens_targets = res["targets"]
+                ens_sum += probs; ens_size += 1
+                eq = (ens_sum / float(ens_size)).astype(np.float32)
+                mets = _metrics_from_probs(eq, ens_targets)
+                print(f"[PFGE {ens_size}] Eq-avg Acc={mets['acc']:.4f}  NLL={mets['nll']:.4f}  ECE(15)={mets['ece']:.4f}")
+                utils.save_checkpoint(args.dir, epoch + 1, name=snap_prefix, state_dict=model_list[i+1].state_dict())
+
+    # ---- FGE branch ----
+    else:
+        # 单模型，按循环 LR 训练
         train_res = utils.train_epochs(loaders['train'], model, criterion, optimizer,
                                        lr_schedule=lr_schedule, cuda=use_cuda)
         eval_res = utils.eval(eval_loader, model, criterion, cuda=use_cuda)
-        time_ep = time.time() - time_ep
-        pfge_ens_acc, pfge_ens_nll, pfge_ens_ece = None, None, None
+        # 在每个 cycle 结束时保存一个快照（最小成本、最常用做法）
+        end_of_cycle = ((epoch % args.cycle) == (args.cycle - 1))
+        if end_of_cycle:
+            utils.bn_update(loaders['train'], model)
+            res = utils.predict(eval_loader, model)
+            probs = res["predictions"].astype(np.float64)
+            if ens_targets is None: ens_targets = res["targets"]
+            ens_sum += probs; ens_size += 1
+            eq = (ens_sum / float(ens_size)).astype(np.float32)
+            mets = _metrics_from_probs(eq, ens_targets)
+            print(f"[FGE {ens_size}] Eq-avg Acc={mets['acc']:.4f}  NLL={mets['nll']:.4f}  ECE(15)={mets['ece']:.4f}")
+            utils.save_checkpoint(args.dir, epoch + 1, name=snap_prefix, state_dict=model.state_dict())
 
-        if (epoch % args.cycle + 1) == args.cycle // 2:
-            if not (0 <= i < num_model) or (i + 1 >= len(model_list)):
-                raise RuntimeError(f"[PFGE] illegal index i={i}, num_model={num_model}, len(model_list)={len(model_list)}")
-            utils.moving_average(model_list[i+1], model, 1.0 / (swa_n[i] + 1))
-            swa_n[i] += 1
-
-        if (epoch + 1) % args.P == 0:
-            utils.bn_update(loaders["train"], model_list[i+1])
-            pfge_res = utils.predict(eval_loader, model_list[i+1])
-            pfge_predictions = pfge_res["predictions"].astype(np.float64)
-            if pfge_targets is None:
-                pfge_targets = pfge_res["targets"]
-            pfge_predictions_sum += pfge_predictions
-            ensemble_size += 1
-            probs_eq = (pfge_predictions_sum / float(ensemble_size)).astype(np.float32)
-            mets = _metrics_from_probs(probs_eq, pfge_targets)
-            pfge_ens_acc, pfge_ens_nll, pfge_ens_ece = 100.0 * mets['acc'], mets['nll'], mets['ece']
-            print(f"[PFGE {ensemble_size}] Eq-avg Acc={mets['acc']:.4f}  NLL={mets['nll']:.4f}  ECE(15)={mets['ece']:.4f}")
-            utils.save_checkpoint(args.dir, epoch + 1, name="pfge", state_dict=model_list[i+1].state_dict())
-
-    else:
-        train_res = utils.train_epochs(loaders['train'], model_list[i], criterion, optimizer_list[i],
-                                       lr_schedule=lr_schedule, cuda=use_cuda)
-        eval_res = utils.eval(eval_loader, model_list[i], criterion, cuda=use_cuda)
-        time_ep = time.time() - time_ep
-        pfge_ens_acc, pfge_ens_nll, pfge_ens_ece = None, None, None
-
-        if (epoch % args.cycle + 1) == args.cycle // 2:
-            if not (0 <= i < num_model) or (i + 1 >= len(model_list)):
-                raise RuntimeError(f"[PFGE] illegal index i={i}, num_model={num_model}, len(model_list)={len(model_list)}")
-            utils.moving_average(model_list[i+1], model_list[i], 1.0/(swa_n[i] + 1))
-            swa_n[i] += 1
-
-        if (epoch + 1) % args.P == 0:
-            utils.bn_update(loaders["train"], model_list[i + 1])
-            pfge_res = utils.predict(eval_loader, model_list[i + 1])
-            pfge_predictions = pfge_res["predictions"].astype(np.float64)
-            if pfge_targets is None:
-                pfge_targets = pfge_res["targets"]
-            pfge_predictions_sum += pfge_predictions
-            ensemble_size += 1
-            probs_eq = (pfge_predictions_sum / float(ensemble_size)).astype(np.float32)
-            mets = _metrics_from_probs(probs_eq, pfge_targets)
-            pfge_ens_acc, pfge_ens_nll, pfge_ens_ece = 100.0 * mets['acc'], mets['nll'], mets['ece']
-            print(f"[PFGE {ensemble_size}] Eq-avg Acc={mets['acc']:.4f}  NLL={mets['nll']:.4f}  ECE(15)={mets['ece']:.4f}")
-            utils.save_checkpoint(args.dir, epoch + 1, name="pfge", state_dict=model_list[i + 1].state_dict())
-
-    values = [epoch + 1, lr_schedule(1.0), train_res['loss'], train_res['accuracy'],
+    t_cost = time.time() - t0
+    lr_now = lr_schedule(1.0)
+    values = [epoch + 1, lr_now, train_res['loss'], train_res['accuracy'],
               eval_res['loss'], eval_res['accuracy'],
-              pfge_ens_acc, pfge_ens_nll, pfge_ens_ece, time_ep]
-    table = tabulate.tabulate([values], columns, tablefmt='simple',
-                              floatfmt='9.4f', missingval='-')
+              100.0 * (ens_sum.argmax(1) == ens_targets).mean() if ens_size > 0 else None,
+              None, None, t_cost]
+    table = tabulate.tabulate([values], columns, tablefmt='simple', floatfmt='9.4f', missingval='-')
     if epoch % 40 == 0:
-        table = table.split('\n')
-        table = '\n'.join([table[1]] + table)
+        table = table.split('\n'); table = '\n'.join([table[1]] + table)
     else:
         table = table.split('\n')[2]
     print(table)
@@ -528,40 +486,30 @@ for epoch in range(args.epochs):
 # Booster Stage (optional) —— 自动跑 linear + logpool
 # =======================
 if args.booster:
-    # 收集 PFGE 快照
     ckpt_paths = sorted(
-        glob.glob(os.path.join(args.dir, 'pfge-*.pt')),
+        glob.glob(os.path.join(args.dir, f'{snap_prefix}-*.pt')),
         key=lambda p: int(os.path.basename(p).split('-')[1].split('.')[0])
     )
     if args.boost_max_K and args.boost_max_K > 0:
         ckpt_paths = ckpt_paths[-args.boost_max_K:]
-
     if len(ckpt_paths) == 0:
-        print('[Booster] No PFGE snapshots found, skip.')
+        print('[Booster] No snapshots found, skip.')
     else:
         print(f'[Booster] Found {len(ckpt_paths)} snapshots.')
-
         def _build_model():
             m = model_cfg.base(*model_cfg.args, num_classes=num_classes, **model_cfg.kwargs)
-            m.to(args.device)
-            return m
-
+            m.to(args.device); return m
         bn_loader = loaders['train']
-        val_loader = eval_loader  # 在 val（若有）或 test（若没有 val）上学 α & 评测
+        val_loader = eval_loader
 
-        # 最终要跑的模式列表
         if args.boost_mode is not None:
             modes_to_run = [args.boost_mode]
         else:
             modes_to_run = ['linear', 'logpool'] if args.boost_modes == 'both' else [args.boost_modes]
 
-        # 参考模型用于选子集（用最后一个 SWA 输出）
+        # 参考模型：最后一个快照
         ref_sd = torch.load(ckpt_paths[-1], map_location='cpu')['state_dict']
-        ref_model = _build_model()
-        ref_model.load_state_dict(ref_sd, strict=True)
-
-        results_val = {}
-        results_test = {}
+        ref_model = _build_model(); ref_model.load_state_dict(ref_sd, strict=True)
 
         for mode in modes_to_run:
             booster = SnapshotBooster(
@@ -576,50 +524,33 @@ if args.booster:
                 crit_fraction=args.boost_crit_fraction,
                 utils_module=utils,
             )
-
-            # 学 α（在 eval_loader 上）
             alpha = booster.learn_alpha(
-                snapshots=ckpt_paths,
-                val_loader=val_loader,
-                ref_for_subset=ref_model,
-                ckpt_key='state_dict',
+                snapshots=ckpt_paths, val_loader=val_loader,
+                ref_for_subset=ref_model, ckpt_key='state_dict'
             )
-            # 保存 α
             with open(os.path.join(args.dir, f'alpha.{mode}.json'), 'w') as f:
                 json.dump({'alpha': alpha.tolist()}, f, indent=2)
 
-            # 评测（强化后，仍在 eval_loader）
             metrics = booster.evaluate(
-                snapshots=ckpt_paths,
-                test_loader=val_loader,
-                alpha=alpha,
-                ckpt_key='state_dict',
+                snapshots=ckpt_paths, test_loader=val_loader,
+                alpha=alpha, ckpt_key='state_dict'
             )
-            results_val[mode] = metrics
-
-            print(f'\n=== PFGE + Booster [{mode}] on {("val" if "val" in loaders else "test")} ===')
+            print(f'\n=== {args.algo.upper()} + Booster [{mode}] on {("val" if "val" in loaders else "test")} ===')
             print(f"Acc: {metrics['acc']:.4f} | NLL: {metrics['nll']:.4f} | ECE(15): {metrics['ece']:.4f}")
 
-            # （可选）最后在真正的 test 上再评一次（不参与调参）
             if args.eval_test_at_end and 'test' in loaders and val_loader is not loaders['test']:
                 metrics_test = booster.evaluate(
-                    snapshots=ckpt_paths,
-                    test_loader=loaders['test'],
-                    alpha=alpha,
-                    ckpt_key='state_dict',
+                    snapshots=ckpt_paths, test_loader=loaders['test'],
+                    alpha=alpha, ckpt_key='state_dict'
                 )
-                results_test[mode] = metrics_test
-                print(f'\n=== Final Test (PFGE + Booster [{mode}], no tuning) ===')
+                print(f'\n=== Final Test ({args.algo.upper()} + Booster [{mode}], no tuning) ===')
                 print(f"Acc: {metrics_test['acc']:.4f} | NLL: {metrics_test['nll']:.4f} | ECE(15): {metrics_test['ece']:.4f}")
 
         # 额外：在 test 上报告一次 Eq-Avg（便于对比）
         if args.eval_test_at_end and 'test' in loaders and val_loader is not loaders['test']:
             eq_metrics_test = eval_eq_ensemble_on_loader(
-                ckpt_paths=ckpt_paths,
-                loader=loaders['test'],
-                build_model_fn=_build_model,
-                bn_loader=bn_loader,
-                device=args.device,
+                ckpt_paths=ckpt_paths, loader=loaders['test'],
+                build_model_fn=_build_model, bn_loader=bn_loader, device=args.device
             )
-            print('\n=== Final Test (PFGE Eq-Avg, no tuning) ===')
+            print(f'\n=== Final Test ({args.algo.upper()} Eq-Avg, no tuning) ===')
             print(f"Acc: {eq_metrics_test['acc']:.4f} | NLL: {eq_metrics_test['nll']:.4f} | ECE(15): {eq_metrics_test['ece']:.4f}")
