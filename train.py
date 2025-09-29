@@ -15,12 +15,8 @@ import utils
 parser = argparse.ArgumentParser(description='SGD training')
 parser.add_argument('--dir', type=str, default='/home/PFGE/', metavar='DIR',
                     help='training directory (default: /home/PFGE/)')
-
 parser.add_argument('--dataset', type=str, default='CIFAR10', metavar='DATASET',
                     help='dataset name (default: CIFAR10)')
-parser.add_argument('--use_test', action='store_true', default=True,
-                    help='if True: use real test set for evaluation; '
-                         'if False: split out a validation set from train')
 parser.add_argument('--data_path', type=str, default=None, metavar='PATH',
                     help='path to datasets location (default: None)')
 parser.add_argument('--batch_size', type=int, default=128, metavar='N',
@@ -28,19 +24,26 @@ parser.add_argument('--batch_size', type=int, default=128, metavar='N',
 parser.add_argument('--num-workers', type=int, default=4, metavar='N',
                     help='number of workers (default: 4)')
 parser.add_argument("--split_classes", type=int, default=None)
-
-# validation split size (only used when --use_test False)
-parser.add_argument('--val_size', type=int, default=5000,
-                    help='number of images held out from training as validation when use_test=False')
-
-# optional: also evaluate on test ONCE at the very end (no tuning)
-parser.add_argument('--eval_test_at_end', action='store_true', default=False,
-                    help='also evaluate on the real test set at the very end (no tuning)')
-
 parser.add_argument('--model', type=str, default=None, metavar='MODEL', required=True,
                     help='model name (default: None)')
 parser.add_argument('--resume', type=str, default=None, metavar='CKPT',
                     help='checkpoint to resume training from (default: None)')
+
+# === 互斥：用 test 还是切 val ===
+mx = parser.add_mutually_exclusive_group()
+mx.add_argument('--use_test', dest='use_test', action='store_true',
+                help='evaluate on real test set during training')
+mx.add_argument('--use_val',  dest='use_test', action='store_false',
+                help='split a validation set from train and evaluate on it')
+parser.set_defaults(use_test=True)
+
+# 只有 --use_val 时才生效
+parser.add_argument('--val_size', type=int, default=5000,
+                    help='when using --use_val, number of images held out from train')
+# 可选：收尾在真实 test 上评一次（不参与调参）
+parser.add_argument('--eval_test_at_end', action='store_true', default=False,
+                    help='also evaluate ONCE on the real test set at the very end')
+
 parser.add_argument('--epochs', type=int, default=200, metavar='N',
                     help='number of epochs to train (default: 200)')
 parser.add_argument('--save_freq', type=int, default=50, metavar='N',
@@ -80,12 +83,12 @@ loaders, num_classes = data.loaders(
         args.num_workers,
         model_cfg.transform_train,
         model_cfg.transform_test,
-        use_validation=not args.use_test,   # -> False => use_validation=True (make val split)
+        use_validation=not args.use_test,   # --use_val => use_validation=True
         val_size=args.val_size,
         split_classes=args.split_classes,
     )
 
-# choose evaluation loader: prefer 'val' when present
+# 评估 loader：优先用 val（若没有就用 test）
 eval_loader = loaders['val'] if ('val' in loaders) else loaders['test']
 _eval_name = 'val' if ('val' in loaders) else 'test'
 
@@ -101,7 +104,7 @@ def _eval_probs_metrics(probs_list, labels_list):
     labels = np.concatenate(labels_list, axis=0)
     acc = float((probs.argmax(1) == labels).mean())
     nll = float(-np.log(np.clip(probs[np.arange(labels.size), labels], 1e-12, 1.0)).mean())
-    # ECE（15 bins）
+    # 15-bin ECE
     bins = np.linspace(0, 1, 16)
     conf = probs.max(1)
     preds = probs.argmax(1)
