@@ -5,7 +5,7 @@ import tabulate
 import time
 import torch
 import torch.nn.functional as F
-import numpy as np  # [ADD] for probs-based metrics
+import numpy as np  # for probs-based metrics
 
 import data
 import models
@@ -19,7 +19,8 @@ parser.add_argument('--dir', type=str, default='/home/PFGE/', metavar='DIR',
 parser.add_argument('--dataset', type=str, default='CIFAR10', metavar='DATASET',
                     help='dataset name (default: CIFAR10)')
 parser.add_argument('--use_test', action='store_true', default=True,
-                    help='switches between validation and test set (default: validation)')
+                    help='if True: use real test set for evaluation; '
+                         'if False: split out a validation set from train')
 parser.add_argument('--data_path', type=str, default=None, metavar='PATH',
                     help='path to datasets location (default: None)')
 parser.add_argument('--batch_size', type=int, default=128, metavar='N',
@@ -27,6 +28,15 @@ parser.add_argument('--batch_size', type=int, default=128, metavar='N',
 parser.add_argument('--num-workers', type=int, default=4, metavar='N',
                     help='number of workers (default: 4)')
 parser.add_argument("--split_classes", type=int, default=None)
+
+# validation split size (only used when --use_test False)
+parser.add_argument('--val_size', type=int, default=5000,
+                    help='number of images held out from training as validation when use_test=False')
+
+# optional: also evaluate on test ONCE at the very end (no tuning)
+parser.add_argument('--eval_test_at_end', action='store_true', default=False,
+                    help='also evaluate on the real test set at the very end (no tuning)')
+
 parser.add_argument('--model', type=str, default=None, metavar='MODEL', required=True,
                     help='model name (default: None)')
 parser.add_argument('--resume', type=str, default=None, metavar='CKPT',
@@ -46,14 +56,8 @@ parser.add_argument('--seed', type=int, default=1, metavar='S', help='random see
 
 args = parser.parse_args()
 
-args.device = None
-
 use_cuda = torch.cuda.is_available()
-
-if use_cuda:
-    args.device = torch.device("cuda")
-else:
-    args.device = torch.device("cpu")
+args.device = torch.device("cuda") if use_cuda else torch.device("cpu")
 
 os.makedirs(args.dir, exist_ok=True)
 with open(os.path.join(args.dir, 'command.sh'), 'w') as f:
@@ -62,7 +66,8 @@ with open(os.path.join(args.dir, 'command.sh'), 'w') as f:
 
 torch.backends.cudnn.benchmark = True
 torch.manual_seed(args.seed)
-torch.cuda.manual_seed(args.seed)
+if use_cuda:
+    torch.cuda.manual_seed(args.seed)
 
 print("Using model %s" % args.model)
 model_cfg = getattr(models, args.model)
@@ -75,16 +80,21 @@ loaders, num_classes = data.loaders(
         args.num_workers,
         model_cfg.transform_train,
         model_cfg.transform_test,
-        use_validation=not args.use_test,
+        use_validation=not args.use_test,   # -> False => use_validation=True (make val split)
+        val_size=args.val_size,
         split_classes=args.split_classes,
     )
+
+# choose evaluation loader: prefer 'val' when present
+eval_loader = loaders['val'] if ('val' in loaders) else loaders['test']
+_eval_name = 'val' if ('val' in loaders) else 'test'
 
 print("Preparing model")
 print(*model_cfg.args)
 model = model_cfg.base(*model_cfg.args, num_classes=num_classes, **model_cfg.kwargs)
 model.to(args.device)
 
-# ========== [ADD] metrics helpers (probs-based NLL/ECE) ==========
+# ========== metrics helpers (probs-based NLL/ECE) ==========
 @torch.no_grad()
 def _eval_probs_metrics(probs_list, labels_list):
     probs = np.concatenate(probs_list, axis=0)
@@ -105,7 +115,7 @@ def _eval_probs_metrics(probs_list, labels_list):
     return {'acc': acc, 'nll': nll, 'ece': ece}
 
 @torch.no_grad()
-def _collect_test_probs(model, loader, device, non_blocking=False):
+def _collect_probs(model, loader, device, non_blocking=False):
     model.eval()
     probs_list, labels_list = [], []
     for x, y in loader:
@@ -116,7 +126,6 @@ def _collect_test_probs(model, loader, device, non_blocking=False):
         labels_list.append(y.cpu().numpy())
     return probs_list, labels_list
 # ================================================================
-
 
 def learning_rate_schedule(epoch):
     t = epoch / args.epochs
@@ -129,7 +138,6 @@ def learning_rate_schedule(epoch):
         factor = lr_ratio
     return args.lr_init * factor
 
-
 criterion = utils.cross_entropy
 optimizer = torch.optim.SGD(
     model.parameters(),
@@ -138,17 +146,27 @@ optimizer = torch.optim.SGD(
     weight_decay=args.wd
 )
 
-
 start_epoch = 0
 if args.resume is not None:
     print("Resume training from %s" % args.resume)
-    checkpoint = torch.load(args.resume)
-    start_epoch = checkpoint["epoch"]
-    model.load_state_dict(checkpoint["state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer"])
+    ckpt = torch.load(args.resume, map_location='cpu')
+    start_epoch = ckpt.get("epoch", 0)
+    # state_dict
+    state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+    model.load_state_dict(state_dict)
+    # optimizer
+    opt_state = None
+    if isinstance(ckpt, dict):
+        opt_state = ckpt.get("optimizer_state", ckpt.get("optimizer", None))
+    if opt_state is not None:
+        try:
+            optimizer.load_state_dict(opt_state)
+        except Exception as e:
+            print(f"[warn] failed to load optimizer state, continue fresh: {e}")
 
-columns = ['ep', 'lr', 'tr_loss', 'tr_acc', 'te_loss', 'te_acc', 'time']
+columns = ['ep', 'lr', 'tr_loss', 'tr_acc', f'{_eval_name}_loss', f'{_eval_name}_acc', 'time']
 
+# save an initial checkpoint
 utils.save_checkpoint(
     args.dir,
     start_epoch - 1,
@@ -156,7 +174,7 @@ utils.save_checkpoint(
     optimizer_state=optimizer.state_dict()
 )
 
-test_res = {'loss': None, 'accuracy': None}
+eval_res = {'loss': None, 'accuracy': None}
 for epoch in range(start_epoch, args.epochs):
     time_ep = time.time()
 
@@ -164,7 +182,7 @@ for epoch in range(start_epoch, args.epochs):
     utils.adjust_learning_rate(optimizer, lr)
 
     train_res = utils.train_epoch(loaders['train'], model, criterion, optimizer, cuda=use_cuda)
-    test_res = utils.eval(loaders['test'], model, criterion, cuda=use_cuda)
+    eval_res = utils.eval(eval_loader, model, criterion, cuda=use_cuda)
 
     if epoch % args.save_freq == 0:
         utils.save_checkpoint(
@@ -175,8 +193,8 @@ for epoch in range(start_epoch, args.epochs):
         )
 
     time_ep = time.time() - time_ep
-    values = [epoch + 1, lr, train_res['loss'], train_res['accuracy'], test_res['loss'],
-              test_res['accuracy'], time_ep]
+    values = [epoch + 1, lr, train_res['loss'], train_res['accuracy'],
+              eval_res['loss'], eval_res['accuracy'], time_ep]
 
     table = tabulate.tabulate([values], columns, tablefmt='simple', floatfmt='9.4f')
     if epoch % 40 == 1 or epoch == start_epoch:
@@ -186,6 +204,7 @@ for epoch in range(start_epoch, args.epochs):
         table = table.split('\n')[2]
     print(table)
 
+# save final checkpoint if not just saved
 if args.epochs % args.save_freq != 0:
     utils.save_checkpoint(
         args.dir,
@@ -194,10 +213,19 @@ if args.epochs % args.save_freq != 0:
         optimizer_state=optimizer.state_dict()
     )
 
-# ===== [ADD] Final test evaluation: Acc / NLL / ECE (probs-based) =====
-probs_list, labels_list = _collect_test_probs(
-    model, loaders['test'], device=args.device, non_blocking=use_cuda
+# ===== Final evaluation on the chosen eval split (val if available, else test) =====
+probs_list, labels_list = _collect_probs(
+    model, eval_loader, device=args.device, non_blocking=use_cuda
 )
 final_metrics = _eval_probs_metrics(probs_list, labels_list)
-print('\n=== Final Test (probs-based) ===')
+print(f'\n=== Final Eval on {_eval_name} (probs-based) ===')
 print(f"Acc: {final_metrics['acc']:.4f} | NLL: {final_metrics['nll']:.4f} | ECE(15): {final_metrics['ece']:.4f}")
+
+# ===== (Optional) also evaluate ONCE on the real test set, no tuning =====
+if args.eval_test_at_end and 'test' in loaders and _eval_name != 'test':
+    probs_list_t, labels_list_t = _collect_probs(
+        model, loaders['test'], device=args.device, non_blocking=use_cuda
+    )
+    test_metrics = _eval_probs_metrics(probs_list_t, labels_list_t)
+    print('\n=== Final Test (no tuning) ===')
+    print(f"Acc: {test_metrics['acc']:.4f} | NLL: {test_metrics['nll']:.4f} | ECE(15): {test_metrics['ece']:.4f}")
