@@ -225,35 +225,43 @@ class SnapshotBooster:
     ) -> Dict[str, float]:
         alpha = np.asarray(alpha, dtype=np.float64)
         mix_accum = None
-        labels_all = []
-
+    
+        # ---- 先把 labels 收一次（保证长度 N）----
+        labels_list = []
+        for _, y in test_loader:
+            labels_list.append(y.numpy())
+        labels = np.concatenate(labels_list, 0)
+    
+        # ---- 再逐快照做加权累加（不再收集 labels）----
         for sd, w in zip(self._iter_snapshots(snapshots, ckpt_key=ckpt_key, map_fn=map_fn), alpha):
             m = self.build_model()
             m.load_state_dict(sd, strict=True)
             m.to(self.device)
             self.utils.bn_update(self.bn_loader, m)
             m.eval()
-
+    
             chunks = []
-            for x, y in test_loader:
+            for x, _ in test_loader:
                 x = x.to(self.device, non_blocking=True)
                 if self.mode == "logpool":
                     chunks.append(F.log_softmax(m(x), dim=1).float().cpu().numpy())
                 else:
                     chunks.append(F.softmax(m(x), dim=1).float().cpu().numpy())
-                labels_all.append(y.numpy())
             pred = np.concatenate(chunks, 0)  # [N,C]
             contrib = w * pred
             mix_accum = contrib if mix_accum is None else (mix_accum + contrib)
+    
             del m
             torch.cuda.empty_cache()
-
-        labels = np.concatenate(labels_all, 0)
+    
+        # ---- 汇总成 probs 并计算指标 ----
         if self.mode == "logpool":
             probs = torch.softmax(torch.from_numpy(mix_accum), dim=1).numpy().astype(np.float32)
         else:
             probs = mix_accum.astype(np.float32)
+    
         return _metrics_from_probs(probs, labels)
+
 
 
 # ===========================
@@ -529,4 +537,5 @@ if args.booster:
         )
         print('\n=== PFGE + Booster (function-side) ===')
         print(f"Acc: {metrics['acc']:.4f} | NLL: {metrics['nll']:.4f} | ECE(15): {metrics['ece']:.4f}")
+
 
